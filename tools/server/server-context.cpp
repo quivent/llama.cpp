@@ -2459,7 +2459,7 @@ static void fwd_compute_logit_lens(
         } catch (...) {
             w_out_cpu.clear();
             w_norm_cpu.clear();
-            SRV_WRN("logit lens: failed to cache unembedding matrix, using proxy\n");
+            SRV_WRN("logit lens: failed to cache unembedding matrix, using proxy%s", "");
         }
     }
 
