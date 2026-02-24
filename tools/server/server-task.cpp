@@ -215,6 +215,7 @@ task_params server_task::params_from_json_cmpl(
     params.return_logit_lens = json_value(data,      "return_logit_lens",  false);
     params.return_entropy_lens = json_value(data,    "return_entropy_lens", false);
     params.return_attention  = json_value(data,       "return_attention",   false);
+    params.return_spectral  = json_value(data,       "return_spectral",    false);
     params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_tokens", defaults.n_predict));
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
     params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
@@ -672,7 +673,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     {
         bool has_signals = !kv_stats.empty() || !fwd_residual.empty() || !fwd_gate.empty()
             || !fwd_rmsnorm.empty() || !fwd_q_proj.empty() || !fwd_logit_lens.empty()
-            || !fwd_entropy_lens.empty() || !fwd_attn.empty();
+            || !fwd_entropy_lens.empty() || !fwd_attn.empty() || !fwd_spectral.empty();
         if (has_signals) {
             json internals = json::object();
 
@@ -782,6 +783,18 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
                 });
             }
             internals["attention_stats"] = arr;
+        }
+        if (!fwd_spectral.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_spectral) {
+                arr.push_back({
+                    {"layer_idx",  s.layer_idx},
+                    {"centroid",   s.centroid},
+                    {"bandwidth",  s.bandwidth},
+                    {"rolloff",    s.rolloff},
+                });
+            }
+            internals["spectral_stats"] = arr;
         }
             res["internals"] = internals;
         }
@@ -879,7 +892,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     {
         bool has_signals = !kv_stats.empty() || !fwd_residual.empty() || !fwd_gate.empty()
             || !fwd_rmsnorm.empty() || !fwd_q_proj.empty() || !fwd_logit_lens.empty()
-            || !fwd_entropy_lens.empty() || !fwd_attn.empty();
+            || !fwd_entropy_lens.empty() || !fwd_attn.empty() || !fwd_spectral.empty();
         if (has_signals) {
             json internals = json::object();
 
@@ -989,6 +1002,18 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
                 });
             }
             internals["attention_stats"] = arr;
+        }
+        if (!fwd_spectral.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_spectral) {
+                arr.push_back({
+                    {"layer_idx",  s.layer_idx},
+                    {"centroid",   s.centroid},
+                    {"bandwidth",  s.bandwidth},
+                    {"rolloff",    s.rolloff},
+                });
+            }
+            internals["spectral_stats"] = arr;
         }
             res["internals"] = internals;
         }

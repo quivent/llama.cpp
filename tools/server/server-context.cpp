@@ -1549,11 +1549,11 @@ private:
         }
 
         // Socratic Tuner: copy forward pass signals from accumulator
-        SRV_INF("fwd_accum: residual=%zu gate=%zu rmsnorm=%zu q_proj=%zu logit_lens=%zu entropy_lens=%zu attn=%zu\n",
+        SRV_INF("fwd_accum: residual=%zu gate=%zu rmsnorm=%zu q_proj=%zu logit_lens=%zu entropy_lens=%zu attn=%zu spectral=%zu\n",
                 fwd_accum.residual_stats.size(), fwd_accum.gate_stats.size(),
                 fwd_accum.rmsnorm_stats.size(), fwd_accum.q_proj_stats.size(),
                 fwd_accum.logit_lens_stats.size(), fwd_accum.entropy_lens_stats.size(),
-                fwd_accum.attn_stats.size());
+                fwd_accum.attn_stats.size(), fwd_accum.spectral_stats.size());
         if (!fwd_accum.residual_stats.empty()) {
             res->fwd_residual = fwd_accum.residual_stats;
         }
@@ -1574,6 +1574,9 @@ private:
         }
         if (!fwd_accum.attn_stats.empty()) {
             res->fwd_attn = fwd_accum.attn_stats;
+        }
+        if (!fwd_accum.spectral_stats.empty()) {
+            res->fwd_spectral = fwd_accum.spectral_stats;
         }
 
         // Clear accumulator after copying — ready for next request
@@ -2104,7 +2107,7 @@ static bool fwd_signal_eval_callback(struct ggml_tensor * t, bool ask, void * us
     const bool is_kq_soft   = (strncmp(name, "kq_soft_max-", 12) == 0);
 
     bool wanted = false;
-    if (is_l_out     && (accum->want_residual || accum->want_logit_lens || accum->want_entropy_lens)) wanted = true;
+    if (is_l_out     && (accum->want_residual || accum->want_logit_lens || accum->want_entropy_lens || accum->want_spectral)) wanted = true;
     if (is_ffn_gate  && accum->want_gate)     wanted = true;
     if (is_attn_norm && accum->want_rmsnorm)  wanted = true;
     if (is_ffn_norm  && accum->want_rmsnorm)  wanted = true;
@@ -2154,7 +2157,7 @@ static bool fwd_signal_eval_callback(struct ggml_tensor * t, bool ask, void * us
         }
 
         // Store for logit lens / entropy lens post-processing
-        if (accum->want_logit_lens || accum->want_entropy_lens) {
+        if (accum->want_logit_lens || accum->want_entropy_lens || accum->want_spectral) {
             accum->l_out_per_layer.push_back(std::move(data));
             accum->l_out_layer_indices.push_back((uint32_t)il);
         }
@@ -2269,8 +2272,11 @@ static bool fwd_signal_eval_callback(struct ggml_tensor * t, bool ask, void * us
         double q_norm = norm_sum / (double)d1;
 
         // Store Q data for Q-K cosine (will be paired with Kcur when it arrives)
-        // Use a simple approach: store in accumulator, pair in Kcur handler
-        // We store the per-head data temporarily
+        accum->prev_q_data.assign(data.begin(), data.end());
+        accum->prev_q_n_heads = (int32_t)d1;
+        accum->prev_q_head_dim = (int32_t)d0;
+        accum->prev_q_layer = il;
+
         accum->q_proj_stats.push_back({(uint32_t)il, q_norm, 0.0}); // cosine filled by Kcur
 
         return true;
@@ -2289,19 +2295,40 @@ static bool fwd_signal_eval_callback(struct ggml_tensor * t, bool ask, void * us
         std::vector<float> k_data(d0 * d1);
         ggml_backend_tensor_get(t, k_data.data(), (size_t)(d2 - 1) * token_size, token_size);
 
-        // Find the matching Q entry for this layer (should be the last one)
-        if (!accum->q_proj_stats.empty()) {
+        // Find the matching Q entry for this layer and compute actual GQA cosine
+        if (!accum->q_proj_stats.empty() && accum->prev_q_layer == il &&
+            !accum->prev_q_data.empty()) {
             auto & last_q = accum->q_proj_stats.back();
             if (last_q.layer_idx == (uint32_t)il) {
-                // Compute Q-K cosine: average cosine(Q_group, K_head) across KV heads
-                // For GQA: n_head / n_head_kv Q heads share each K head
-                // We need Q data but we didn't store it — we only stored the norm.
-                // For a clean implementation, we'd need to store Q data.
-                // Simpler approach: compute cosine between mean Q and mean K vectors
-                // This is still informative for measuring Q-K alignment.
-                // Actually, we can't do this without Q data. Set cosine to 0 for now
-                // and revisit if needed. The q_norm alone is valuable.
-                last_q.q_k_cosine = 0.0;
+                // GQA cosine: average Q heads in each group, cosine with K head
+                // 64 Q heads / 8 K heads = 8 Q heads per group
+                const int32_t n_q_heads = accum->prev_q_n_heads;
+                const int32_t head_dim  = accum->prev_q_head_dim;
+                const int32_t n_kv_heads = (int32_t)d1;
+                const int32_t group_size = (n_kv_heads > 0 && n_q_heads >= n_kv_heads)
+                                           ? n_q_heads / n_kv_heads : 1;
+
+                double cosine_sum = 0.0;
+                for (int32_t kh = 0; kh < n_kv_heads; kh++) {
+                    // Average the Q heads in this group
+                    std::vector<float> q_avg(head_dim, 0.0f);
+                    for (int32_t g = 0; g < group_size; g++) {
+                        int32_t qh = kh * group_size + g;
+                        if (qh >= n_q_heads) break;
+                        const float * q_head = accum->prev_q_data.data() + qh * head_dim;
+                        for (int32_t i = 0; i < head_dim; i++) {
+                            q_avg[i] += q_head[i];
+                        }
+                    }
+                    for (int32_t i = 0; i < head_dim; i++) {
+                        q_avg[i] /= (float)group_size;
+                    }
+
+                    // Cosine similarity between averaged Q group and K head
+                    const float * k_head = k_data.data() + kh * d0;
+                    cosine_sum += fwd_cosine_sim(q_avg.data(), k_head, head_dim);
+                }
+                last_q.q_k_cosine = cosine_sum / (double)n_kv_heads;
             }
         }
 
@@ -2358,15 +2385,12 @@ static bool fwd_signal_eval_callback(struct ggml_tensor * t, bool ask, void * us
     return true;
 }
 
-// Logit lens + entropy lens post-processing
-// Called after decode when l_out vectors have been stored
 static void fwd_compute_logit_lens(
         fwd_signal_accumulator & accum,
         llama_context * ctx) {
     if (accum.l_out_per_layer.empty()) return;
     if (!accum.want_logit_lens && !accum.want_entropy_lens) return;
 
-    // Get the output weight matrix (unembedding)
     const llama_model * model_ptr = llama_get_model(ctx);
     if (!model_ptr) return;
 
@@ -2374,86 +2398,263 @@ static void fwd_compute_logit_lens(
     const int32_t n_embd  = llama_model_n_embd(model_ptr);
     if (n_vocab <= 0 || n_embd <= 0) return;
 
-    // We need the output weight tensor. Unfortunately, we can't easily access it
-    // through the C API after decode. The logit lens requires:
-    //   logits = RMSNorm(h) @ W_output
-    // where W_output is the unembedding matrix [n_vocab, n_embd].
-    //
-    // Alternative approach: use the final layer's logits that llama_decode already computed.
-    // For intermediate layers, we'd need the weight matrix.
-    //
-    // Since we can't get the weight matrix through the C API, we use an approximation:
-    // Feed each stored l_out through the model's output norm + logit head.
-    // But this requires extra forward passes which is expensive.
-    //
-    // Pragmatic approach for now: use the stored l_out vectors to compute
-    // relative entropy changes between layers (entropy lens derivative).
-    // The actual logit lens requires weight matrix access — we'll implement
-    // that by exposing the weight matrix through a new API in a future phase.
-    //
-    // For entropy lens: compute entropy of the activation distribution itself
-    // as a proxy for how "decided" the representation is at each layer.
-    // This captures the same signal (narrowing = convergence) without needing W_u.
+    // Try to get the output (unembedding) tensor for true logit lens
+    const ggml_tensor * w_out_tensor = llama_model_get_output_tensor(model_ptr);
+    const ggml_tensor * w_norm_tensor = llama_model_get_output_norm_tensor(model_ptr);
 
-    double prev_entropy = -1.0;
+    // Cache dequantized output weights (static — computed once per model load)
+    static std::vector<float> w_out_cpu;
+    static std::vector<float> w_norm_cpu;
+    static int32_t cached_n_vocab = 0;
+    static int32_t cached_n_embd = 0;
+    static bool tried_cache = false;
+
+    bool have_true_lens = false;
+
+    if (w_out_tensor && !tried_cache) {
+        tried_cache = true;
+        const size_t n_elem_out = (size_t)n_vocab * n_embd;
+        const enum ggml_type wtype = w_out_tensor->type;
+
+        try {
+            w_out_cpu.resize(n_elem_out);
+
+            if (wtype == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(w_out_tensor, w_out_cpu.data(), 0, n_elem_out * sizeof(float));
+            } else if (wtype == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_elem_out);
+                ggml_backend_tensor_get(w_out_tensor, tmp.data(), 0, n_elem_out * sizeof(ggml_fp16_t));
+                for (size_t i = 0; i < n_elem_out; i++) {
+                    w_out_cpu[i] = ggml_fp16_to_fp32(tmp[i]);
+                }
+            } else {
+                // Quantized — use type traits to dequantize
+                const size_t row_size = ggml_row_size(wtype, n_embd);
+                std::vector<uint8_t> raw_row(row_size);
+                const auto to_float = ggml_get_type_traits(wtype)->to_float;
+                if (to_float) {
+                    for (int32_t v = 0; v < n_vocab; v++) {
+                        ggml_backend_tensor_get(w_out_tensor, raw_row.data(),
+                            (size_t)v * row_size, row_size);
+                        to_float(raw_row.data(), w_out_cpu.data() + (size_t)v * n_embd, n_embd);
+                    }
+                } else {
+                    w_out_cpu.clear();
+                }
+            }
+
+            // Cache norm weights if available
+            if (w_norm_tensor && w_norm_tensor->type == GGML_TYPE_F32) {
+                w_norm_cpu.resize(n_embd);
+                ggml_backend_tensor_get(w_norm_tensor, w_norm_cpu.data(), 0, n_embd * sizeof(float));
+            }
+
+            if (!w_out_cpu.empty()) {
+                cached_n_vocab = n_vocab;
+                cached_n_embd = n_embd;
+                have_true_lens = true;
+                SRV_INF("logit lens: cached unembedding matrix (%d x %d, type=%d)\n",
+                    n_vocab, n_embd, (int)wtype);
+            }
+        } catch (...) {
+            w_out_cpu.clear();
+            w_norm_cpu.clear();
+            SRV_WRN("logit lens: failed to cache unembedding matrix, using proxy\n");
+        }
+    }
+
+    if (!w_out_cpu.empty() && cached_n_vocab == n_vocab && cached_n_embd == n_embd) {
+        have_true_lens = true;
+    }
+
+    double prev_entropy = accum.prev_entropy_lens;
+
     for (size_t i = 0; i < accum.l_out_per_layer.size(); i++) {
         const auto & h = accum.l_out_per_layer[i];
         const uint32_t layer_idx = accum.l_out_layer_indices[i];
         const size_t dim = h.size();
 
-        // Compute softmax of absolute values (proxy for output distribution)
-        // This measures how concentrated/spread the representation is
-        double max_val = 0.0;
-        for (size_t j = 0; j < dim; j++) {
-            double v = std::fabs((double)h[j]);
-            if (v > max_val) max_val = v;
-        }
+        if ((int32_t)dim != n_embd) continue;
 
-        double exp_sum = 0.0;
-        std::vector<double> probs(dim);
-        for (size_t j = 0; j < dim; j++) {
-            probs[j] = std::exp(std::fabs((double)h[j]) - max_val);
-            exp_sum += probs[j];
-        }
-        if (exp_sum > 0.0) {
-            for (size_t j = 0; j < dim; j++) {
-                probs[j] /= exp_sum;
+        if (have_true_lens) {
+            // True logit lens: RMSNorm(h) @ W_out → softmax → argmax + entropy
+            std::vector<float> normed(n_embd);
+
+            // RMSNorm
+            if (!w_norm_cpu.empty()) {
+                double sum_sq = 0.0;
+                for (int32_t j = 0; j < n_embd; j++) {
+                    sum_sq += (double)h[j] * (double)h[j];
+                }
+                double rms = std::sqrt(sum_sq / n_embd + 1e-6);
+                for (int32_t j = 0; j < n_embd; j++) {
+                    normed[j] = (float)((double)h[j] / rms) * w_norm_cpu[j];
+                }
+            } else {
+                // No norm weights — use raw hidden state
+                std::copy(h.begin(), h.end(), normed.begin());
             }
-        }
 
-        // Shannon entropy of the softmax distribution
-        double entropy = 0.0;
-        for (size_t j = 0; j < dim; j++) {
-            if (probs[j] > 1e-12) {
-                entropy -= probs[j] * std::log(probs[j]);
-            }
-        }
-
-        // Entropy derivative
-        double entropy_deriv = 0.0;
-        if (prev_entropy >= 0.0) {
-            entropy_deriv = entropy - prev_entropy;
-        }
-        prev_entropy = entropy;
-
-        if (accum.want_entropy_lens) {
-            accum.entropy_lens_stats.push_back({layer_idx, entropy, entropy_deriv});
-        }
-
-        // For logit lens: we need the actual unembedding matrix
-        // For now, compute a proxy: find the dominant dimension and its confidence
-        if (accum.want_logit_lens) {
-            // Find argmax and its probability as confidence
-            double top_prob = probs[0];
-            for (size_t j = 1; j < dim; j++) {
-                if (probs[j] > top_prob) {
-                    top_prob = probs[j];
+            // Matmul: logits[v] = sum(normed[j] * W_out[v * n_embd + j])
+            // Find max logit for numerical stability
+            double max_logit = -1e30;
+            int32_t top_token = 0;
+            std::vector<double> logits(n_vocab);
+            for (int32_t v = 0; v < n_vocab; v++) {
+                double dot = 0.0;
+                const float * w_row = w_out_cpu.data() + (size_t)v * n_embd;
+                for (int32_t j = 0; j < n_embd; j++) {
+                    dot += (double)normed[j] * (double)w_row[j];
+                }
+                logits[v] = dot;
+                if (dot > max_logit) {
+                    max_logit = dot;
+                    top_token = v;
                 }
             }
-            // Note: top_token = -1 indicates proxy mode (softmax of |activations|,
-            // not true logit lens via unembedding matrix).
-            accum.logit_lens_stats.push_back({layer_idx, -1, top_prob});
+
+            // Softmax + entropy
+            double exp_sum = 0.0;
+            for (int32_t v = 0; v < n_vocab; v++) {
+                logits[v] = std::exp(logits[v] - max_logit);
+                exp_sum += logits[v];
+            }
+
+            double top_prob = 0.0;
+            double entropy = 0.0;
+            for (int32_t v = 0; v < n_vocab; v++) {
+                double p = logits[v] / exp_sum;
+                if (v == top_token) top_prob = p;
+                if (p > 1e-12) {
+                    entropy -= p * std::log(p);
+                }
+            }
+
+            // Entropy derivative
+            double entropy_deriv = 0.0;
+            if (prev_entropy >= 0.0) {
+                entropy_deriv = entropy - prev_entropy;
+            }
+            prev_entropy = entropy;
+
+            if (accum.want_entropy_lens) {
+                accum.entropy_lens_stats.push_back({layer_idx, entropy, entropy_deriv});
+            }
+            if (accum.want_logit_lens) {
+                accum.logit_lens_stats.push_back({layer_idx, top_token, top_prob});
+            }
+        } else {
+            // Proxy mode: softmax of absolute activations
+            double max_val = 0.0;
+            for (size_t j = 0; j < dim; j++) {
+                double v = std::fabs((double)h[j]);
+                if (v > max_val) max_val = v;
+            }
+
+            double exp_sum = 0.0;
+            std::vector<double> probs(dim);
+            for (size_t j = 0; j < dim; j++) {
+                probs[j] = std::exp(std::fabs((double)h[j]) - max_val);
+                exp_sum += probs[j];
+            }
+            if (exp_sum > 0.0) {
+                for (size_t j = 0; j < dim; j++) {
+                    probs[j] /= exp_sum;
+                }
+            }
+
+            double entropy = 0.0;
+            for (size_t j = 0; j < dim; j++) {
+                if (probs[j] > 1e-12) {
+                    entropy -= probs[j] * std::log(probs[j]);
+                }
+            }
+
+            double entropy_deriv = 0.0;
+            if (prev_entropy >= 0.0) {
+                entropy_deriv = entropy - prev_entropy;
+            }
+            prev_entropy = entropy;
+
+            if (accum.want_entropy_lens) {
+                accum.entropy_lens_stats.push_back({layer_idx, entropy, entropy_deriv});
+            }
+            if (accum.want_logit_lens) {
+                double top_prob = probs[0];
+                for (size_t j = 1; j < dim; j++) {
+                    if (probs[j] > top_prob) top_prob = probs[j];
+                }
+                accum.logit_lens_stats.push_back({layer_idx, -1, top_prob});
+            }
         }
+    }
+
+    accum.prev_entropy_lens = prev_entropy;
+}
+
+// Spectral analysis of hidden state vectors
+// Uses naive DFT to compute spectral features from l_out vectors
+static void fwd_compute_spectral(fwd_signal_accumulator & accum) {
+    if (!accum.want_spectral) return;
+    if (accum.l_out_per_layer.empty()) return;
+
+    for (size_t i = 0; i < accum.l_out_per_layer.size(); i++) {
+        const auto & h = accum.l_out_per_layer[i];
+        const uint32_t layer_idx = accum.l_out_layer_indices[i];
+        const size_t N = h.size();
+        if (N == 0) continue;
+
+        // Compute magnitude spectrum via naive DFT (N/2 bins)
+        const size_t n_bins = N / 2;
+        std::vector<double> mag(n_bins, 0.0);
+        double total_energy = 0.0;
+
+        for (size_t k = 0; k < n_bins; k++) {
+            double re = 0.0, im = 0.0;
+            const double freq = 2.0 * M_PI * (double)k / (double)N;
+            for (size_t n = 0; n < N; n++) {
+                double angle = freq * (double)n;
+                re += (double)h[n] * std::cos(angle);
+                im -= (double)h[n] * std::sin(angle);
+            }
+            mag[k] = std::sqrt(re * re + im * im);
+            total_energy += mag[k];
+        }
+
+        if (total_energy < 1e-12) {
+            accum.spectral_stats.push_back({layer_idx, 0.0, 0.0, 0.0});
+            continue;
+        }
+
+        // Centroid: weighted mean of bin indices / n_bins -> [0, 1]
+        double centroid_sum = 0.0;
+        for (size_t k = 0; k < n_bins; k++) {
+            centroid_sum += (double)k * mag[k];
+        }
+        double centroid = (centroid_sum / total_energy) / (double)n_bins;
+
+        // Bandwidth: weighted std dev around centroid / n_bins -> [0, ~0.5]
+        double centroid_bin = centroid_sum / total_energy;
+        double bw_sum = 0.0;
+        for (size_t k = 0; k < n_bins; k++) {
+            double diff = (double)k - centroid_bin;
+            bw_sum += diff * diff * mag[k];
+        }
+        double bandwidth = std::sqrt(bw_sum / total_energy) / (double)n_bins;
+
+        // Rolloff: bin where cumulative energy reaches 85% / n_bins -> [0, 1]
+        double cumulative = 0.0;
+        double rolloff = 1.0;
+        double threshold_energy = total_energy * 0.85;
+        for (size_t k = 0; k < n_bins; k++) {
+            cumulative += mag[k];
+            if (cumulative >= threshold_energy) {
+                rolloff = (double)k / (double)n_bins;
+                break;
+            }
+        }
+
+        accum.spectral_stats.push_back({layer_idx, centroid, bandwidth, rolloff});
     }
 }
 
@@ -3120,7 +3321,7 @@ static void fwd_compute_logit_lens(
             const auto & p = slot_batched->task->params;
             if (p.return_residual || p.return_gate || p.return_rmsnorm ||
                 p.return_q_proj || p.return_logit_lens || p.return_entropy_lens ||
-                p.return_attention) {
+                p.return_attention || p.return_spectral) {
                 // Clear accumulated results (keep flags)
                 fwd_accum.residual_stats.clear();
                 fwd_accum.gate_stats.clear();
@@ -3129,6 +3330,7 @@ static void fwd_compute_logit_lens(
                 fwd_accum.logit_lens_stats.clear();
                 fwd_accum.entropy_lens_stats.clear();
                 fwd_accum.attn_stats.clear();
+                fwd_accum.spectral_stats.clear();
                 fwd_accum.prev_l_out.clear();
                 fwd_accum.l_out_per_layer.clear();
                 fwd_accum.l_out_layer_indices.clear();
@@ -3143,6 +3345,7 @@ static void fwd_compute_logit_lens(
                 fwd_accum.want_logit_lens   = p.return_logit_lens;
                 fwd_accum.want_entropy_lens = p.return_entropy_lens;
                 fwd_accum.want_attention    = p.return_attention;
+                fwd_accum.want_spectral     = p.return_spectral;
                 fwd_accum.layer_step        = std::max(p.kv_layer_step, (int32_t)1);
 
                 llama_set_eval_callback(ctx, fwd_signal_eval_callback, &fwd_accum);
@@ -3411,6 +3614,7 @@ static void fwd_compute_logit_lens(
         // Socratic Tuner: clear eval callback and do logit lens post-processing
         if (fwd_signals_active) {
             fwd_compute_logit_lens(fwd_accum, ctx);
+            fwd_compute_spectral(fwd_accum);
             llama_set_eval_callback(ctx, nullptr, nullptr);
             fwd_accum.active = false;
         }

@@ -8881,6 +8881,15 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
 }
 
+// Socratic Tuner: access output tensors for logit lens
+const struct ggml_tensor * llama_model_get_output_tensor(const struct llama_model * model) {
+    return model ? model->output : nullptr;
+}
+
+const struct ggml_tensor * llama_model_get_output_norm_tensor(const struct llama_model * model) {
+    return model ? model->output_norm : nullptr;
+}
+
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer;
 }

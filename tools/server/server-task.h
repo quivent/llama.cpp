@@ -83,6 +83,7 @@ struct task_params {
     bool return_logit_lens   = false;
     bool return_entropy_lens = false;
     bool return_attention    = false;
+    bool return_spectral    = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -406,6 +407,14 @@ struct fwd_attn_stat {
     double   recency_ratio;    // fraction of attention on recent positions
 };
 
+// Socratic Tuner: spectral analysis of hidden states
+struct fwd_spectral_stat {
+    uint32_t layer_idx;
+    double   centroid;    // spectral centroid (center of mass of frequency spectrum) [0,1]
+    double   bandwidth;   // spectral bandwidth (spread around centroid) [0,~0.5]
+    double   rolloff;     // frequency below which 85% of energy concentrated [0,1]
+};
+
 // Forward pass signal accumulator — passed as user_data to eval callback
 struct fwd_signal_accumulator {
     bool active = false;
@@ -418,6 +427,7 @@ struct fwd_signal_accumulator {
     bool want_logit_lens   = false;
     bool want_entropy_lens = false;
     bool want_attention    = false;
+    bool want_spectral     = false;
 
     int32_t layer_step     = 1;
 
@@ -429,6 +439,7 @@ struct fwd_signal_accumulator {
     std::vector<fwd_logit_lens_stat>   logit_lens_stats;
     std::vector<fwd_entropy_lens_stat> entropy_lens_stats;
     std::vector<fwd_attn_stat>         attn_stats;
+    std::vector<fwd_spectral_stat>     spectral_stats;
 
     // Scratch storage for cross-layer computations
     std::vector<float> prev_l_out;          // previous layer's l_out for cosine sim
@@ -441,6 +452,12 @@ struct fwd_signal_accumulator {
     // Previous entropy for derivative computation
     double prev_entropy_lens = -1.0;
 
+    // Q vector storage for Q-K cosine computation (paired with Kcur handler)
+    std::vector<float> prev_q_data;
+    int32_t prev_q_n_heads = 0;
+    int32_t prev_q_head_dim = 0;
+    int32_t prev_q_layer = -1;
+
     void clear() {
         active = false;
         residual_stats.clear();
@@ -450,11 +467,16 @@ struct fwd_signal_accumulator {
         logit_lens_stats.clear();
         entropy_lens_stats.clear();
         attn_stats.clear();
+        spectral_stats.clear();
         prev_l_out.clear();
         l_out_per_layer.clear();
         l_out_layer_indices.clear();
         rms_pre_attn_map.clear();
         prev_entropy_lens = -1.0;
+        prev_q_data.clear();
+        prev_q_n_heads = 0;
+        prev_q_head_dim = 0;
+        prev_q_layer = -1;
     }
 };
 
@@ -493,6 +515,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<fwd_logit_lens_stat>   fwd_logit_lens;
     std::vector<fwd_entropy_lens_stat> fwd_entropy_lens;
     std::vector<fwd_attn_stat>         fwd_attn;
+    std::vector<fwd_spectral_stat>     fwd_spectral;
 
     // response formatting
     bool               verbose  = false;
