@@ -1056,6 +1056,27 @@ std::vector<llama_kv_cache::layer_stats> llama_kv_cache::extract_layer_stats(siz
         // read V tensor
         if (layer.v && ggml_nelements(layer.v) > 0) {
             dequantize_tensor_data(layer.v, v_data, MAX_ELEMENTS);
+
+            // When V cache is transposed (!flash-attn), data is stored as
+            // [embd_dim_0: all kv_slots][embd_dim_1: all kv_slots]...
+            // Only the first n_used positions in each kv_size stripe
+            // contain valid data; the rest is zero-padding from unused slots.
+            // Filter to valid elements only.
+            if (v_trans && !v_data.empty()) {
+                const size_t kv_sz  = get_size();
+                const size_t n_used = v_cells.empty() ? kv_sz
+                                    : (size_t)v_cells[0].used_max_p1();
+                if (n_used < kv_sz && kv_sz > 0) {
+                    std::vector<float> valid;
+                    valid.reserve(v_data.size() * n_used / kv_sz + 1);
+                    for (size_t i = 0; i < v_data.size(); i++) {
+                        if ((i % kv_sz) < n_used) {
+                            valid.push_back(v_data[i]);
+                        }
+                    }
+                    v_data = std::move(valid);
+                }
+            }
         }
 
         // compute stats on K
