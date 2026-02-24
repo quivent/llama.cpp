@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"  // Socratic Tuner: KV cache extraction
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3166,6 +3167,84 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// Socratic Tuner: extract KV cache per-layer statistics
+int32_t llama_kv_cache_extract_stats(
+        struct llama_context * ctx,
+        struct llama_kv_cache_layer_stats * out,
+        int32_t out_size,
+        int32_t sample_cap) {
+    if (!ctx) {
+        return 0;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!mem) {
+        return 0;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        return 0;
+    }
+
+    auto stats = kv->extract_layer_stats(sample_cap > 0 ? (size_t)sample_cap : 0);
+    const int32_t n = (int32_t)stats.size();
+
+    if (!out) {
+        return n; // query mode: just return count
+    }
+
+    const int32_t n_write = std::min(n, out_size);
+    for (int32_t i = 0; i < n_write; i++) {
+        out[i].layer_idx  = stats[i].layer_idx;
+        out[i].mean_abs_k = stats[i].mean_abs_k;
+        out[i].mean_abs_v = stats[i].mean_abs_v;
+        out[i].max_abs    = stats[i].max_abs;
+        out[i].std_dev    = stats[i].std_dev;
+        out[i].sparsity   = stats[i].sparsity;
+    }
+
+    return n_write;
+}
+
+// Socratic Tuner: extract per-head KV cache signals
+int32_t llama_kv_cache_extract_head_signals(
+        struct llama_context * ctx,
+        struct llama_kv_cache_head_signal * out,
+        int32_t out_size,
+        int32_t sample_cap) {
+    if (!ctx) {
+        return 0;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!mem) {
+        return 0;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        return 0;
+    }
+
+    auto signals = kv->extract_head_signals(sample_cap > 0 ? (size_t)sample_cap : 0);
+    const int32_t n = (int32_t)signals.size();
+
+    if (!out) {
+        return n;
+    }
+
+    const int32_t n_write = std::min(n, out_size);
+    for (int32_t i = 0; i < n_write; i++) {
+        out[i].layer_idx       = signals[i].layer_idx;
+        out[i].head_idx        = signals[i].head_idx;
+        out[i].mean_activation = signals[i].mean_activation;
+        out[i].max_activation  = signals[i].max_activation;
+    }
+
+    return n_write;
 }
 
 // llama state API

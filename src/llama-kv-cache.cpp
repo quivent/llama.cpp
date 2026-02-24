@@ -991,6 +991,171 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+// ── Socratic Tuner extension: extract per-layer KV cache statistics ──
+
+static void dequantize_tensor_data(
+        const ggml_tensor * tensor,
+        std::vector<float> & out,
+        size_t max_elements) {
+    const size_t n_elements = ggml_nelements(tensor);
+    const size_t n = std::min(n_elements, max_elements);
+    out.resize(n);
+
+    const ggml_type type = tensor->type;
+
+    if (type == GGML_TYPE_F32) {
+        // direct copy
+        ggml_backend_tensor_get(tensor, out.data(), 0, n * sizeof(float));
+    } else if (type == GGML_TYPE_F16) {
+        // read f16 bytes, convert to f32
+        std::vector<uint8_t> raw(n * ggml_type_size(type));
+        ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
+        const auto * traits = ggml_get_type_traits(type);
+        if (traits && traits->to_float) {
+            traits->to_float(raw.data(), out.data(), n);
+        }
+    } else {
+        // quantized: read full blocks, dequantize
+        const auto * traits = ggml_get_type_traits(type);
+        if (!traits || !traits->to_float || traits->blck_size == 0) {
+            // unsupported type, zero out
+            std::fill(out.begin(), out.end(), 0.0f);
+            return;
+        }
+        const int64_t blck_size = traits->blck_size;
+        // round n up to block boundary
+        const size_t n_blocks = (n + blck_size - 1) / blck_size;
+        const size_t n_rounded = n_blocks * blck_size;
+        const size_t raw_bytes = n_blocks * traits->type_size;
+        std::vector<uint8_t> raw(raw_bytes);
+        ggml_backend_tensor_get(tensor, raw.data(), 0, std::min(raw_bytes, ggml_nbytes(tensor)));
+        out.resize(n_rounded);
+        traits->to_float(raw.data(), out.data(), n_rounded);
+        out.resize(n); // trim back
+    }
+}
+
+std::vector<llama_kv_cache::layer_stats> llama_kv_cache::extract_layer_stats(size_t sample_cap) const {
+    std::vector<layer_stats> result;
+    result.reserve(layers.size());
+
+    // cap per-tensor reads for performance (0 = default 512K floats ~2MB)
+    const size_t MAX_ELEMENTS = sample_cap > 0 ? sample_cap : 512 * 1024;
+
+    for (const auto & layer : layers) {
+        layer_stats stats = {};
+        stats.layer_idx = layer.il;
+
+        std::vector<float> k_data, v_data;
+
+        // read K tensor
+        if (layer.k && ggml_nelements(layer.k) > 0) {
+            dequantize_tensor_data(layer.k, k_data, MAX_ELEMENTS);
+        }
+
+        // read V tensor
+        if (layer.v && ggml_nelements(layer.v) > 0) {
+            dequantize_tensor_data(layer.v, v_data, MAX_ELEMENTS);
+        }
+
+        // compute stats on K
+        if (!k_data.empty()) {
+            double sum = 0.0, sum_sq = 0.0, max_val = 0.0;
+            size_t near_zero = 0;
+            for (float x : k_data) {
+                double ax = std::abs((double)x);
+                sum    += ax;
+                sum_sq += ax * ax;
+                if (ax > max_val) max_val = ax;
+                if (ax < 1e-6) near_zero++;
+            }
+            stats.mean_abs_k = sum / k_data.size();
+            stats.max_abs    = max_val;
+            stats.sparsity   = (double)near_zero / k_data.size();
+
+            double variance = (sum_sq / k_data.size()) - (stats.mean_abs_k * stats.mean_abs_k);
+            stats.std_dev = variance > 0 ? std::sqrt(variance) : 0.0;
+        }
+
+        // compute stats on V
+        if (!v_data.empty()) {
+            double sum = 0.0, max_val = 0.0;
+            for (float x : v_data) {
+                double ax = std::abs((double)x);
+                sum += ax;
+                if (ax > max_val) max_val = ax;
+            }
+            stats.mean_abs_v = sum / v_data.size();
+            if (max_val > stats.max_abs) stats.max_abs = max_val;
+        }
+
+        result.push_back(stats);
+    }
+
+    return result;
+}
+
+std::vector<llama_kv_cache::head_signal> llama_kv_cache::extract_head_signals(size_t sample_cap) const {
+    std::vector<head_signal> result;
+
+    const uint32_t d_k = hparams.n_embd_head_k;
+
+    // cap total floats read per tensor (0 = default 512K floats ~2MB)
+    const size_t MAX_ELEMENTS = sample_cap > 0 ? sample_cap : 512 * 1024;
+
+    for (const auto & layer : layers) {
+        if (!layer.k || ggml_nelements(layer.k) == 0) {
+            continue;
+        }
+
+        const uint32_t n_head = hparams.n_head_kv(layer.il);
+        if (n_head == 0 || d_k == 0) {
+            continue;
+        }
+
+        // Read K tensor data
+        std::vector<float> k_data;
+        dequantize_tensor_data(layer.k, k_data, MAX_ELEMENTS);
+
+        // K layout: [n_embd_k_gqa, kv_size, n_stream]
+        // n_embd_k_gqa = n_head * d_k
+        // For each cached position, the first dimension packs all heads contiguously:
+        //   [head0_dim0..head0_dimK, head1_dim0..head1_dimK, ...]
+        const uint32_t head_stride = d_k;
+        const uint32_t row_size = n_head * d_k; // one row = one cached token
+        const size_t n_rows = k_data.size() / row_size;
+
+        if (n_rows == 0) {
+            continue;
+        }
+
+        for (uint32_t h = 0; h < n_head; h++) {
+            double sum = 0.0;
+            double max_val = 0.0;
+            size_t count = 0;
+
+            for (size_t row = 0; row < n_rows; row++) {
+                const size_t base = row * row_size + h * head_stride;
+                for (uint32_t d = 0; d < d_k && (base + d) < k_data.size(); d++) {
+                    double ax = std::abs((double)k_data[base + d]);
+                    sum += ax;
+                    if (ax > max_val) max_val = ax;
+                    count++;
+                }
+            }
+
+            head_signal sig = {};
+            sig.layer_idx = layer.il;
+            sig.head_idx  = h;
+            sig.mean_activation = count > 0 ? sum / count : 0.0;
+            sig.max_activation  = max_val;
+            result.push_back(sig);
+        }
+    }
+
+    return result;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

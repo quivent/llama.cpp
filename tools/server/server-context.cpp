@@ -1495,6 +1495,54 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        // Socratic Tuner: extract KV cache stats if requested
+        if (slot.task->params.return_kv_cache) {
+            const int32_t layer_step = std::max(slot.task->params.kv_layer_step, (int32_t)1);
+
+            // Extract layer stats (apply layer_step sampling + sample_cap)
+            const int32_t sample_cap = slot.task->params.kv_sample_cap;
+            int32_t n_layers = llama_kv_cache_extract_stats(slot.ctx, nullptr, 0, sample_cap);
+            if (n_layers > 0) {
+                std::vector<llama_kv_cache_layer_stats> stats(n_layers);
+                llama_kv_cache_extract_stats(slot.ctx, stats.data(), n_layers, sample_cap);
+                res->kv_stats.reserve(layer_step == 1 ? n_layers : n_layers / layer_step + 1);
+                for (const auto & s : stats) {
+                    if (layer_step > 1 && (s.layer_idx % layer_step) != 0) {
+                        continue; // skip non-sampled layers
+                    }
+                    res->kv_stats.push_back({
+                        s.layer_idx,
+                        s.mean_abs_k,
+                        s.mean_abs_v,
+                        s.max_abs,
+                        s.std_dev,
+                        s.sparsity,
+                    });
+                }
+            }
+
+            // Extract per-head signals when signal_level != "zones"
+            if (slot.task->params.signal_level != "zones") {
+                int32_t n_heads = llama_kv_cache_extract_head_signals(slot.ctx, nullptr, 0, sample_cap);
+                if (n_heads > 0) {
+                    std::vector<llama_kv_cache_head_signal> signals(n_heads);
+                    llama_kv_cache_extract_head_signals(slot.ctx, signals.data(), n_heads, sample_cap);
+                    res->kv_head_signals.reserve(n_heads);
+                    for (const auto & s : signals) {
+                        if (layer_step > 1 && (s.layer_idx % layer_step) != 0) {
+                            continue; // skip non-sampled layers
+                        }
+                        res->kv_head_signals.push_back({
+                            s.layer_idx,
+                            s.head_idx,
+                            s.mean_activation,
+                            s.max_activation,
+                        });
+                    }
+                }
+            }
+        }
+
         queue_results.send(std::move(res));
     }
 

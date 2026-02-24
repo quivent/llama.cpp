@@ -204,6 +204,10 @@ task_params server_task::params_from_json_cmpl(
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
     params.return_tokens    = json_value(data,       "return_tokens",      false);
     params.return_progress  = json_value(data,       "return_progress",    false);
+    params.return_kv_cache  = json_value(data,       "return_kv_cache",    false);
+    params.signal_level     = json_value(data,       "signal_level",       std::string("zones"));
+    params.kv_layer_step    = json_value(data,       "kv_layer_step",      (int32_t)1);
+    params.kv_sample_cap    = json_value(data,       "kv_sample_cap",      (int32_t)0);
     params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_tokens", defaults.n_predict));
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
     params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
@@ -656,6 +660,38 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+
+    // Socratic Tuner: include KV cache stats if present
+    if (!kv_stats.empty()) {
+        json layer_stats_arr = json::array();
+        for (const auto & s : kv_stats) {
+            layer_stats_arr.push_back({
+                {"layer_idx",  s.layer_idx},
+                {"mean_abs_k", s.mean_abs_k},
+                {"mean_abs_v", s.mean_abs_v},
+                {"max_abs",    s.max_abs},
+                {"std_dev",    s.std_dev},
+                {"sparsity",   s.sparsity},
+            });
+        }
+        json internals = json{
+            {"layer_stats", layer_stats_arr},
+        };
+        if (!kv_head_signals.empty()) {
+            json head_signals_arr = json::array();
+            for (const auto & h : kv_head_signals) {
+                head_signals_arr.push_back({
+                    {"layer_idx",       h.layer_idx},
+                    {"head_idx",        h.head_idx},
+                    {"mean_activation", h.mean_activation},
+                    {"max_activation",  h.max_activation},
+                });
+            }
+            internals["head_signals"] = head_signals_arr;
+        }
+        res["internals"] = internals;
+    }
+
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -743,6 +779,39 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         }},
         {"id", oaicompat_cmpl_id}
     };
+
+    // Socratic Tuner: include KV cache layer stats if present
+    if (!kv_stats.empty()) {
+        json layer_stats_arr = json::array();
+        for (const auto & s : kv_stats) {
+            layer_stats_arr.push_back({
+                {"layer_idx",  s.layer_idx},
+                {"mean_abs_k", s.mean_abs_k},
+                {"mean_abs_v", s.mean_abs_v},
+                {"max_abs",    s.max_abs},
+                {"std_dev",    s.std_dev},
+                {"sparsity",   s.sparsity},
+            });
+        }
+        json internals = json{
+            {"layer_stats", layer_stats_arr},
+        };
+
+        if (!kv_head_signals.empty()) {
+            json head_signals_arr = json::array();
+            for (const auto & h : kv_head_signals) {
+                head_signals_arr.push_back({
+                    {"layer_idx",       h.layer_idx},
+                    {"head_idx",        h.head_idx},
+                    {"mean_activation", h.mean_activation},
+                    {"max_activation",  h.max_activation},
+                });
+            }
+            internals["head_signals"] = head_signals_arr;
+        }
+
+        res["internals"] = internals;
+    }
 
     // extra fields for debugging purposes
     if (verbose) {

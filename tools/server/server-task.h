@@ -70,6 +70,10 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool return_kv_cache     = false; // Socratic Tuner: return KV cache layer stats in response
+    std::string signal_level = "zones"; // "zones" = layer stats only, "heads" = include per-head signals
+    int32_t kv_layer_step    = 1;       // Sample every Nth layer (1 = all, 2 = every other, etc.)
+    int32_t kv_sample_cap    = 0;       // Max floats per tensor (0 = use default 524288)
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -330,6 +334,24 @@ struct completion_token_output {
 
 };
 
+// Socratic Tuner: per-layer KV cache statistics
+struct kv_layer_stat {
+    uint32_t layer_idx;
+    double   mean_abs_k;
+    double   mean_abs_v;
+    double   max_abs;
+    double   std_dev;
+    double   sparsity;
+};
+
+// Socratic Tuner: per-head attention activation
+struct kv_head_signal {
+    uint32_t layer_idx;
+    uint32_t head_idx;
+    double   mean_activation;
+    double   max_activation;
+};
+
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
@@ -352,6 +374,10 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
+
+    // Socratic Tuner: KV cache layer stats + head signals
+    std::vector<kv_layer_stat>  kv_stats;
+    std::vector<kv_head_signal> kv_head_signals;
 
     // response formatting
     bool               verbose  = false;
