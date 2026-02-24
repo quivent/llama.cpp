@@ -26,6 +26,11 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    // Socratic Tuner: adapter lifecycle + training
+    SERVER_TASK_TYPE_LOAD_ADAPTER,
+    SERVER_TASK_TYPE_UNLOAD_ADAPTER,
+    SERVER_TASK_TYPE_GET_ADAPTER,
+    SERVER_TASK_TYPE_TRAIN_SOCRATIC,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -178,6 +183,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_LOAD_ADAPTER / TRAIN_SOCRATIC
+    std::string adapter_path;   // for LOAD_ADAPTER
+    json        train_params;   // for TRAIN_SOCRATIC
 
     server_task() = default;
 
@@ -714,6 +723,42 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+// Socratic Tuner: adapter load result
+struct server_task_result_load_adapter : server_task_result {
+    std::string status;     // "loaded" or "error"
+    std::string path;
+    int32_t     n_tensors = 0;
+    json        metadata;   // adapter GGUF metadata
+
+    virtual json to_json() override;
+};
+
+// Socratic Tuner: adapter query result
+struct server_task_result_get_adapter : server_task_result {
+    struct adapter_info {
+        std::string path;
+        float       scale;
+        json        metadata;
+    };
+    std::vector<adapter_info> adapters;
+
+    virtual json to_json() override;
+};
+
+// Socratic Tuner: training result
+struct server_task_result_train : server_task_result {
+    bool        success = false;
+    std::string adapter_path;
+    double      before_perplexity  = 0.0;
+    double      after_perplexity   = 0.0;
+    double      improvement        = 0.0;
+    int         turns_used         = 0;
+    double      training_time_seconds = 0.0;
+    std::string error;
+
     virtual json to_json() override;
 };
 

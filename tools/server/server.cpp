@@ -194,6 +194,11 @@ int main(int argc, char ** argv) {
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",       ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",       ex_wrapper(routes.post_lora_adapters));
+    // Socratic Tuner: adapter lifecycle + training
+    ctx_http.post("/v1/adapters/load",    ex_wrapper(routes.post_adapter_load));
+    ctx_http.post("/v1/adapters/unload",  ex_wrapper(routes.post_adapter_unload));
+    ctx_http.get ("/v1/adapters/current", ex_wrapper(routes.get_adapter_current));
+    ctx_http.post("/v1/train/socratic",   ex_wrapper(routes.post_train_socratic));
     // Save & load slots
     ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));

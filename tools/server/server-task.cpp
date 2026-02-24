@@ -2111,6 +2111,61 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_task_result_load_adapter (Socratic Tuner)
+//
+
+json server_task_result_load_adapter::to_json() {
+    json result = {
+        {"status",    status},
+        {"path",      path},
+        {"n_tensors", n_tensors},
+    };
+    if (!metadata.empty()) {
+        result["metadata"] = metadata;
+    }
+    return result;
+}
+
+//
+// server_task_result_get_adapter (Socratic Tuner)
+//
+
+json server_task_result_get_adapter::to_json() {
+    json arr = json::array();
+    for (auto & a : adapters) {
+        json entry = {
+            {"path",  a.path},
+            {"scale", a.scale},
+        };
+        if (!a.metadata.empty()) {
+            entry["metadata"] = a.metadata;
+        }
+        arr.push_back(std::move(entry));
+    }
+    return json {{ "adapters", arr }};
+}
+
+//
+// server_task_result_train (Socratic Tuner)
+//
+
+json server_task_result_train::to_json() {
+    json result = {
+        {"success",                success},
+        {"adapter_path",           adapter_path},
+        {"before_perplexity",      before_perplexity},
+        {"after_perplexity",       after_perplexity},
+        {"improvement",            improvement},
+        {"turns_used",             turns_used},
+        {"training_time_seconds",  training_time_seconds},
+    };
+    if (!error.empty()) {
+        result["error"] = error;
+    }
+    return result;
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

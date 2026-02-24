@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cinttypes>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <cmath>
@@ -2015,6 +2016,170 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
+            // ── Socratic Tuner: adapter lifecycle ──────────────────────
+
+            case SERVER_TASK_TYPE_LOAD_ADAPTER:
+                {
+                    auto res = std::make_unique<server_task_result_load_adapter>();
+                    res->id = task.id;
+
+                    llama_adapter_lora * adapter = llama_adapter_lora_init(model, task.adapter_path.c_str());
+                    if (!adapter) {
+                        res->status = "error";
+                        res->path = task.adapter_path;
+                        SRV_WRN("failed to load adapter: %s\n", task.adapter_path.c_str());
+                    } else {
+                        // Add to params_base.lora_adapters list with scale=1.0
+                        common_adapter_lora_info info;
+                        info.path  = task.adapter_path;
+                        info.scale = 1.0f;
+                        info.ptr   = adapter;
+                        params_base.lora_adapters.push_back(info);
+
+                        res->status    = "loaded";
+                        res->path      = task.adapter_path;
+                        res->n_tensors = llama_adapter_meta_count(adapter);
+
+                        // Extract GGUF metadata
+                        json meta_json = json::object();
+                        const int32_t n_meta = llama_adapter_meta_count(adapter);
+                        char key_buf[256];
+                        char val_buf[512];
+                        for (int32_t i = 0; i < n_meta; ++i) {
+                            if (llama_adapter_meta_key_by_index(adapter, i, key_buf, sizeof(key_buf)) > 0 &&
+                                llama_adapter_meta_val_str_by_index(adapter, i, val_buf, sizeof(val_buf)) > 0) {
+                                meta_json[key_buf] = val_buf;
+                            }
+                        }
+                        res->metadata = meta_json;
+
+                        SRV_INF("loaded adapter: %s (%d metadata entries)\n", task.adapter_path.c_str(), n_meta);
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_UNLOAD_ADAPTER:
+                {
+                    // Set all adapter scales to 0 (effectively disabling them)
+                    for (auto & lora : params_base.lora_adapters) {
+                        lora.scale = 0.0f;
+                    }
+                    SRV_INF("unloaded all adapters (scales set to 0), count=%zu\n", params_base.lora_adapters.size());
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_GET_ADAPTER:
+                {
+                    auto res = std::make_unique<server_task_result_get_adapter>();
+                    res->id = task.id;
+                    for (auto & lora : params_base.lora_adapters) {
+                        if (lora.scale > 0.0f) {
+                            // Extract metadata for active adapters
+                            json meta_json = json::object();
+                            if (lora.ptr) {
+                                const int32_t n_meta = llama_adapter_meta_count(lora.ptr);
+                                char key_buf[256];
+                                char val_buf[512];
+                                for (int32_t i = 0; i < n_meta; ++i) {
+                                    if (llama_adapter_meta_key_by_index(lora.ptr, i, key_buf, sizeof(key_buf)) > 0 &&
+                                        llama_adapter_meta_val_str_by_index(lora.ptr, i, val_buf, sizeof(val_buf)) > 0) {
+                                        meta_json[key_buf] = val_buf;
+                                    }
+                                }
+                            }
+                            res->adapters.push_back({lora.path, lora.scale, meta_json});
+                        }
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_TRAIN_SOCRATIC:
+                {
+                    auto res = std::make_unique<server_task_result_train>();
+                    res->id = task.id;
+
+                    // Write training data to temp file
+                    std::string data_path = "/tmp/socratic_train_" + std::to_string(task.id) + ".json";
+                    {
+                        std::ofstream ofs(data_path);
+                        if (!ofs.is_open()) {
+                            res->success = false;
+                            res->error = "Failed to write training data to " + data_path;
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        ofs << task.train_params.dump();
+                    }
+
+                    // Determine model path for the training sidecar
+                    std::string model_path = params_base.model.path;
+
+                    // Output path from training params or default
+                    std::string output_path = task.train_params.value("output_path", "adapters/socratic");
+
+                    // Build command — socratic-train.py lives alongside the server binary
+                    std::string cmd = "python3 tools/socratic-train.py"
+                        " --data "       + data_path +
+                        " --model-path " + model_path +
+                        " --output "     + output_path +
+                        " --result "     + data_path + ".result.json"
+                        " 2>&1";
+
+                    SRV_INF("starting training sidecar: %s\n", cmd.c_str());
+                    int rc = system(cmd.c_str());
+
+                    // Parse result JSON written by the training script
+                    std::string result_path = data_path + ".result.json";
+                    std::ifstream ifs(result_path);
+                    if (rc == 0 && ifs.is_open()) {
+                        try {
+                            json result_json = json::parse(ifs);
+                            res->success              = result_json.value("success", false);
+                            res->adapter_path         = result_json.value("adapter_path", output_path);
+                            res->before_perplexity    = result_json.value("before_perplexity", 0.0);
+                            res->after_perplexity     = result_json.value("after_perplexity", 0.0);
+                            res->improvement          = result_json.value("improvement", 0.0);
+                            res->turns_used           = result_json.value("turns_used", 0);
+                            res->training_time_seconds = result_json.value("training_time_seconds", 0.0);
+                            res->error                = result_json.value("error", "");
+                        } catch (const std::exception & e) {
+                            res->success = false;
+                            res->error = std::string("Failed to parse training result: ") + e.what();
+                        }
+                    } else {
+                        res->success = false;
+                        res->error = "Training sidecar failed with exit code " + std::to_string(rc);
+                    }
+
+                    // Clean up temp files
+                    std::remove(data_path.c_str());
+                    std::remove(result_path.c_str());
+
+                    // Auto-load the adapter if training succeeded
+                    if (res->success && !res->adapter_path.empty()) {
+                        // Look for .gguf file in adapter output
+                        std::string gguf_path = res->adapter_path;
+                        if (gguf_path.find(".gguf") == std::string::npos) {
+                            gguf_path += "/adapter.gguf";
+                        }
+                        llama_adapter_lora * adapter = llama_adapter_lora_init(model, gguf_path.c_str());
+                        if (adapter) {
+                            common_adapter_lora_info info;
+                            info.path  = gguf_path;
+                            info.scale = 1.0f;
+                            info.ptr   = adapter;
+                            params_base.lora_adapters.push_back(info);
+                            SRV_INF("auto-loaded trained adapter: %s\n", gguf_path.c_str());
+                        } else {
+                            SRV_WRN("training succeeded but failed to auto-load adapter: %s\n", gguf_path.c_str());
+                        }
+                    }
+
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -4727,6 +4892,122 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // ── Socratic Tuner: adapter lifecycle endpoints ──────────────────
+
+    this->post_adapter_load = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        std::string adapter_path = body.value("adapter_path", "");
+        if (adapter_path.empty()) {
+            res->error(format_error_response("adapter_path is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_LOAD_ADAPTER);
+            task.id = rd.get_new_id();
+            task.adapter_path = adapter_path;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_load_adapter*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_adapter_unload = [this](const server_http_req & req) {
+        auto res = create_response();
+        (void)req; // body not needed
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_UNLOAD_ADAPTER);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(json{{ "status", "unloaded" }});
+        return res;
+    };
+
+    this->get_adapter_current = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_GET_ADAPTER);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_get_adapter*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_train_socratic = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_TRAIN_SOCRATIC);
+            task.id = rd.get_new_id();
+            task.train_params = body;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_train*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };
