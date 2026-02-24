@@ -1056,27 +1056,6 @@ std::vector<llama_kv_cache::layer_stats> llama_kv_cache::extract_layer_stats(siz
         // read V tensor
         if (layer.v && ggml_nelements(layer.v) > 0) {
             dequantize_tensor_data(layer.v, v_data, MAX_ELEMENTS);
-
-            // When V cache is transposed (!flash-attn), data is stored as
-            // [embd_dim_0: all kv_slots][embd_dim_1: all kv_slots]...
-            // Only the first n_used positions in each kv_size stripe
-            // contain valid data; the rest is zero-padding from unused slots.
-            // Filter to valid elements only.
-            if (v_trans && !v_data.empty()) {
-                const size_t kv_sz  = get_size();
-                const size_t n_used = v_cells.empty() ? kv_sz
-                                    : (size_t)v_cells[0].used_max_p1();
-                if (n_used < kv_sz && kv_sz > 0) {
-                    std::vector<float> valid;
-                    valid.reserve(v_data.size() * n_used / kv_sz + 1);
-                    for (size_t i = 0; i < v_data.size(); i++) {
-                        if ((i % kv_sz) < n_used) {
-                            valid.push_back(v_data[i]);
-                        }
-                    }
-                    v_data = std::move(valid);
-                }
-            }
         }
 
         // compute stats on K
@@ -1099,15 +1078,24 @@ std::vector<llama_kv_cache::layer_stats> llama_kv_cache::extract_layer_stats(siz
         }
 
         // compute stats on V
+        // When v_trans (no flash-attn), V data is stored via transposed scatter
+        // writes: V[embd_j, slot_s] → flat position j*kv_size+s. A linear read
+        // includes vast zero-padding from unused KV slots. Compute mean over
+        // non-zero elements only to get the true signal magnitude.
         if (!v_data.empty()) {
             double sum = 0.0, max_val = 0.0;
+            size_t count = 0;
             for (float x : v_data) {
                 double ax = std::abs((double)x);
+                if (v_trans && ax < 1e-20) continue; // skip unused-slot zeros
                 sum += ax;
+                count++;
                 if (ax > max_val) max_val = ax;
             }
-            stats.mean_abs_v = sum / v_data.size();
-            if (max_val > stats.max_abs) stats.max_abs = max_val;
+            if (count > 0) {
+                stats.mean_abs_v = sum / count;
+                if (max_val > stats.max_abs) stats.max_abs = max_val;
+            }
         }
 
         result.push_back(stats);
