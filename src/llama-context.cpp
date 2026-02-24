@@ -941,6 +941,11 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_eval_callback(ggml_backend_sched_eval_callback callback, void * user_data) {
+    cparams.cb_eval           = callback;
+    cparams.cb_eval_user_data = user_data;
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1082,6 +1087,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // Always set eval callback (it may change per-request via llama_set_eval_callback)
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1090,7 +1098,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3167,6 +3174,16 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// Socratic Tuner: set/swap eval callback per-request
+void llama_set_eval_callback(
+        struct llama_context * ctx,
+        ggml_backend_sched_eval_callback callback,
+        void * user_data) {
+    if (ctx) {
+        ctx->set_eval_callback(callback, user_data);
+    }
 }
 
 // Socratic Tuner: extract KV cache per-layer statistics

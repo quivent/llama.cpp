@@ -792,6 +792,18 @@ extern "C" {
             int32_t sample_cap);
 
     //
+    // Forward pass eval callback (Socratic Tuner extension)
+    //
+
+    // Set/swap the eval callback on a context. This allows per-request callback
+    // registration without recreating the context. The callback fires after each
+    // tensor is computed during llama_decode(). Set callback=NULL to clear.
+    LLAMA_API void llama_set_eval_callback(
+            struct llama_context * ctx,
+            ggml_backend_sched_eval_callback callback,
+            void * user_data);
+
+    //
     // State / sessions
     //
 

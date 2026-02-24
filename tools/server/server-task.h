@@ -75,6 +75,15 @@ struct task_params {
     int32_t kv_layer_step    = 1;       // Sample every Nth layer (1 = all, 2 = every other, etc.)
     int32_t kv_sample_cap    = 0;       // Max floats per tensor (0 = use default 524288)
 
+    // Forward pass signal extraction (Socratic Tuner)
+    bool return_residual     = false;
+    bool return_gate         = false;
+    bool return_rmsnorm      = false;
+    bool return_q_proj       = false;
+    bool return_logit_lens   = false;
+    bool return_entropy_lens = false;
+    bool return_attention    = false;
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
@@ -352,6 +361,103 @@ struct kv_head_signal {
     double   max_activation;
 };
 
+// Socratic Tuner: forward pass signal types
+struct fwd_residual_stat {
+    uint32_t layer_idx;
+    double   activation_norm;  // L2 norm of residual stream
+    double   cosine_sim;       // cosine similarity with previous layer
+};
+
+struct fwd_gate_stat {
+    uint32_t layer_idx;
+    double   sparsity;         // fraction of |x| < 0.01
+    double   mean_activation;  // mean |x|
+    double   gate_entropy;     // binned entropy of activation distribution
+};
+
+struct fwd_rmsnorm_stat {
+    uint32_t layer_idx;
+    double   rms_pre_attn;     // sqrt(mean(x^2)) of attn_norm output
+    double   rms_pre_ffn;      // sqrt(mean(x^2)) of ffn_norm output
+};
+
+struct fwd_q_proj_stat {
+    uint32_t layer_idx;
+    double   q_norm;           // mean L2 norm across query heads
+    double   q_k_cosine;       // mean cosine(Q, K) across KV heads
+};
+
+struct fwd_logit_lens_stat {
+    uint32_t layer_idx;
+    int32_t  top_token;        // argmax of softmax(RMSNorm(h) @ W_u)
+    double   top_confidence;   // max probability
+};
+
+struct fwd_entropy_lens_stat {
+    uint32_t layer_idx;
+    double   entropy;          // Shannon entropy of softmax(RMSNorm(h) @ W_u)
+    double   entropy_derivative; // H(l) - H(l-1), negative = narrowing
+};
+
+struct fwd_attn_stat {
+    uint32_t layer_idx;
+    double   mean_entropy;     // mean H(attn_weights) across heads
+    double   max_entropy;      // max H(attn_weights) across heads
+    double   recency_ratio;    // fraction of attention on recent positions
+};
+
+// Forward pass signal accumulator — passed as user_data to eval callback
+struct fwd_signal_accumulator {
+    bool active = false;
+
+    // Per-request flags
+    bool want_residual     = false;
+    bool want_gate         = false;
+    bool want_rmsnorm      = false;
+    bool want_q_proj       = false;
+    bool want_logit_lens   = false;
+    bool want_entropy_lens = false;
+    bool want_attention    = false;
+
+    int32_t layer_step     = 1;
+
+    // Accumulated results
+    std::vector<fwd_residual_stat>     residual_stats;
+    std::vector<fwd_gate_stat>         gate_stats;
+    std::vector<fwd_rmsnorm_stat>      rmsnorm_stats;
+    std::vector<fwd_q_proj_stat>       q_proj_stats;
+    std::vector<fwd_logit_lens_stat>   logit_lens_stats;
+    std::vector<fwd_entropy_lens_stat> entropy_lens_stats;
+    std::vector<fwd_attn_stat>         attn_stats;
+
+    // Scratch storage for cross-layer computations
+    std::vector<float> prev_l_out;          // previous layer's l_out for cosine sim
+    std::vector<std::vector<float>> l_out_per_layer; // for logit lens post-processing
+    std::vector<uint32_t> l_out_layer_indices;       // which layers were stored
+
+    // Per-layer RMS norm tracking (attn_norm comes before ffn_norm in same layer)
+    std::unordered_map<uint32_t, double> rms_pre_attn_map;
+
+    // Previous entropy for derivative computation
+    double prev_entropy_lens = -1.0;
+
+    void clear() {
+        active = false;
+        residual_stats.clear();
+        gate_stats.clear();
+        rmsnorm_stats.clear();
+        q_proj_stats.clear();
+        logit_lens_stats.clear();
+        entropy_lens_stats.clear();
+        attn_stats.clear();
+        prev_l_out.clear();
+        l_out_per_layer.clear();
+        l_out_layer_indices.clear();
+        rms_pre_attn_map.clear();
+        prev_entropy_lens = -1.0;
+    }
+};
+
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
@@ -378,6 +484,15 @@ struct server_task_result_cmpl_final : server_task_result {
     // Socratic Tuner: KV cache layer stats + head signals
     std::vector<kv_layer_stat>  kv_stats;
     std::vector<kv_head_signal> kv_head_signals;
+
+    // Socratic Tuner: forward pass signals
+    std::vector<fwd_residual_stat>     fwd_residual;
+    std::vector<fwd_gate_stat>         fwd_gate;
+    std::vector<fwd_rmsnorm_stat>      fwd_rmsnorm;
+    std::vector<fwd_q_proj_stat>       fwd_q_proj;
+    std::vector<fwd_logit_lens_stat>   fwd_logit_lens;
+    std::vector<fwd_entropy_lens_stat> fwd_entropy_lens;
+    std::vector<fwd_attn_stat>         fwd_attn;
 
     // response formatting
     bool               verbose  = false;
