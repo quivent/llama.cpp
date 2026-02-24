@@ -1443,6 +1443,15 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // Socratic Tuner: run post-hoc signal computations before building response
+        // These must run before we copy fwd_accum into the result, because they
+        // populate logit_lens_stats, entropy_lens_stats, and spectral_stats from
+        // the l_out_per_layer data collected during the eval callback.
+        if (fwd_accum.active) {
+            fwd_compute_logit_lens(fwd_accum, ctx);
+            fwd_compute_spectral(fwd_accum);
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3819,10 +3828,8 @@ static void fwd_compute_spectral(fwd_signal_accumulator & accum) {
             }
         }
 
-        // Socratic Tuner: clear eval callback and do logit lens post-processing
+        // Socratic Tuner: clear eval callback (post-processing moved to send_final_response)
         if (fwd_signals_active) {
-            fwd_compute_logit_lens(fwd_accum, ctx);
-            fwd_compute_spectral(fwd_accum);
             llama_set_eval_callback(ctx, nullptr, nullptr);
             fwd_accum.active = false;
         }
