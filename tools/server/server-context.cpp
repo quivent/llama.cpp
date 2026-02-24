@@ -2592,8 +2592,47 @@ static void fwd_compute_logit_lens(
     accum.prev_entropy_lens = prev_entropy;
 }
 
-// Spectral analysis of hidden state vectors
-// Uses naive DFT to compute spectral features from l_out vectors
+// In-place radix-2 Cooley-Tukey FFT. N must be a power of 2.
+// Operates on interleaved [re0, im0, re1, im1, ...] array of length 2*N.
+static void fwd_fft_radix2(double * buf, size_t N) {
+    // Bit-reversal permutation
+    for (size_t i = 1, j = 0; i < N; i++) {
+        size_t bit = N >> 1;
+        for (; j & bit; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+        if (i < j) {
+            std::swap(buf[2*i],   buf[2*j]);
+            std::swap(buf[2*i+1], buf[2*j+1]);
+        }
+    }
+    // Butterfly passes
+    for (size_t len = 2; len <= N; len <<= 1) {
+        const double ang = -2.0 * M_PI / (double)len;
+        const double wr_step = std::cos(ang);
+        const double wi_step = std::sin(ang);
+        for (size_t i = 0; i < N; i += len) {
+            double wr = 1.0, wi = 0.0;
+            for (size_t j = 0; j < len / 2; j++) {
+                const size_t u = i + j;
+                const size_t v = u + len / 2;
+                const double tr = wr * buf[2*v] - wi * buf[2*v+1];
+                const double ti = wr * buf[2*v+1] + wi * buf[2*v];
+                buf[2*v]   = buf[2*u]   - tr;
+                buf[2*v+1] = buf[2*u+1] - ti;
+                buf[2*u]   += tr;
+                buf[2*u+1] += ti;
+                const double wr_new = wr * wr_step - wi * wi_step;
+                wi = wr * wi_step + wi * wr_step;
+                wr = wr_new;
+            }
+        }
+    }
+}
+
+// Spectral analysis of hidden state vectors via radix-2 FFT.
+// Computes centroid, bandwidth, rolloff from magnitude spectrum.
 static void fwd_compute_spectral(fwd_signal_accumulator & accum) {
     if (!accum.want_spectral) return;
     if (accum.l_out_per_layer.empty()) return;
@@ -2601,23 +2640,27 @@ static void fwd_compute_spectral(fwd_signal_accumulator & accum) {
     for (size_t i = 0; i < accum.l_out_per_layer.size(); i++) {
         const auto & h = accum.l_out_per_layer[i];
         const uint32_t layer_idx = accum.l_out_layer_indices[i];
-        const size_t N = h.size();
-        if (N == 0) continue;
+        const size_t N_raw = h.size();
+        if (N_raw == 0) continue;
 
-        // Compute magnitude spectrum via naive DFT (N/2 bins)
+        // Round down to largest power of 2 <= N_raw for radix-2 FFT
+        size_t N = 1;
+        while (N * 2 <= N_raw) N <<= 1;
+
+        // Pack into interleaved complex buffer [re, im, re, im, ...]
+        std::vector<double> buf(2 * N, 0.0);
+        for (size_t n = 0; n < N; n++) {
+            buf[2*n] = (double)h[n];
+        }
+
+        fwd_fft_radix2(buf.data(), N);
+
+        // Compute magnitude spectrum (first N/2 bins)
         const size_t n_bins = N / 2;
-        std::vector<double> mag(n_bins, 0.0);
+        std::vector<double> mag(n_bins);
         double total_energy = 0.0;
-
         for (size_t k = 0; k < n_bins; k++) {
-            double re = 0.0, im = 0.0;
-            const double freq = 2.0 * M_PI * (double)k / (double)N;
-            for (size_t n = 0; n < N; n++) {
-                double angle = freq * (double)n;
-                re += (double)h[n] * std::cos(angle);
-                im -= (double)h[n] * std::sin(angle);
-            }
-            mag[k] = std::sqrt(re * re + im * im);
+            mag[k] = std::sqrt(buf[2*k] * buf[2*k] + buf[2*k+1] * buf[2*k+1]);
             total_energy += mag[k];
         }
 
