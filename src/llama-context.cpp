@@ -6,6 +6,8 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"       // Socratic Tuner: KV cache extraction
+#include "llama-kv-cache-iswa.h"  // Socratic Tuner: iSWA (e.g. Gemma) KV cache extraction
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1097,6 +1099,11 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_eval_callback(ggml_backend_sched_eval_callback callback, void * user_data) {
+    cparams.cb_eval           = callback;
+    cparams.cb_eval_user_data = user_data;
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1268,6 +1275,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // Always set eval callback (it may change per-request via llama_set_eval_callback)
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1283,7 +1293,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3795,6 +3804,114 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// Socratic Tuner: set/swap eval callback per-request
+void llama_set_eval_callback(
+        struct llama_context * ctx,
+        ggml_backend_sched_eval_callback callback,
+        void * user_data) {
+    if (ctx) {
+        ctx->set_eval_callback(callback, user_data);
+    }
+}
+
+// Socratic Tuner: extract KV cache per-layer statistics
+int32_t llama_kv_cache_extract_stats(
+        struct llama_context * ctx,
+        struct llama_kv_cache_layer_stats * out,
+        int32_t out_size,
+        int32_t sample_cap) {
+    if (!ctx) {
+        return 0;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!mem) {
+        return 0;
+    }
+
+    std::vector<llama_kv_cache::layer_stats> stats;
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        stats = kv->extract_layer_stats(sample_cap > 0 ? (size_t)sample_cap : 0);
+    } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        // iSWA (e.g. Gemma): merge stats from the full-attn and SWA caches —
+        // each layer lives in exactly one of the two
+        stats = iswa->get_base()->extract_layer_stats(sample_cap > 0 ? (size_t)sample_cap : 0);
+        auto swa = iswa->get_swa()->extract_layer_stats(sample_cap > 0 ? (size_t)sample_cap : 0);
+        stats.insert(stats.end(), swa.begin(), swa.end());
+        std::sort(stats.begin(), stats.end(), [](const auto & a, const auto & b) { return a.layer_idx < b.layer_idx; });
+    } else {
+        return 0;
+    }
+
+    const int32_t n = (int32_t)stats.size();
+
+    if (!out) {
+        return n; // query mode: just return count
+    }
+
+    const int32_t n_write = std::min(n, out_size);
+    for (int32_t i = 0; i < n_write; i++) {
+        out[i].layer_idx  = stats[i].layer_idx;
+        out[i].mean_abs_k = stats[i].mean_abs_k;
+        out[i].mean_abs_v = stats[i].mean_abs_v;
+        out[i].max_abs    = stats[i].max_abs;
+        out[i].std_dev    = stats[i].std_dev;
+        out[i].sparsity   = stats[i].sparsity;
+    }
+
+    return n_write;
+}
+
+// Socratic Tuner: extract per-head KV cache signals
+int32_t llama_kv_cache_extract_head_signals(
+        struct llama_context * ctx,
+        struct llama_kv_cache_head_signal * out,
+        int32_t out_size,
+        int32_t sample_cap) {
+    if (!ctx) {
+        return 0;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!mem) {
+        return 0;
+    }
+
+    std::vector<llama_kv_cache::head_signal> signals;
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        signals = kv->extract_head_signals(sample_cap > 0 ? (size_t)sample_cap : 0);
+    } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        signals = iswa->get_base()->extract_head_signals(sample_cap > 0 ? (size_t)sample_cap : 0);
+        auto swa = iswa->get_swa()->extract_head_signals(sample_cap > 0 ? (size_t)sample_cap : 0);
+        signals.insert(signals.end(), swa.begin(), swa.end());
+        std::sort(signals.begin(), signals.end(), [](const auto & a, const auto & b) {
+            return a.layer_idx != b.layer_idx ? a.layer_idx < b.layer_idx : a.head_idx < b.head_idx;
+        });
+    } else {
+        return 0;
+    }
+
+    const int32_t n = (int32_t)signals.size();
+
+    if (!out) {
+        return n;
+    }
+
+    const int32_t n_write = std::min(n, out_size);
+    for (int32_t i = 0; i < n_write; i++) {
+        out[i].layer_idx       = signals[i].layer_idx;
+        out[i].head_idx        = signals[i].head_idx;
+        out[i].mean_activation = signals[i].mean_activation;
+        out[i].max_activation  = signals[i].max_activation;
+    }
+
+    return n_write;
 }
 
 // llama state API

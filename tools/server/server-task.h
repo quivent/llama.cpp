@@ -27,6 +27,11 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    // Socratic Tuner: adapter lifecycle + training
+    SERVER_TASK_TYPE_LOAD_ADAPTER,
+    SERVER_TASK_TYPE_UNLOAD_ADAPTER,
+    SERVER_TASK_TYPE_GET_ADAPTER,
+    SERVER_TASK_TYPE_TRAIN_SOCRATIC,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -75,6 +80,20 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool return_kv_cache     = false; // Socratic Tuner: return KV cache layer stats in response
+    std::string signal_level = "zones"; // "zones" = layer stats only, "heads" = include per-head signals
+    int32_t kv_layer_step    = 1;       // Sample every Nth layer (1 = all, 2 = every other, etc.)
+    int32_t kv_sample_cap    = 0;       // Max floats per tensor (0 = use default 524288)
+
+    // Forward pass signal extraction (Socratic Tuner)
+    bool return_residual     = false;
+    bool return_gate         = false;
+    bool return_rmsnorm      = false;
+    bool return_q_proj       = false;
+    bool return_logit_lens   = false;
+    bool return_entropy_lens = false;
+    bool return_attention    = false;
+    bool return_spectral    = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -171,6 +190,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_LOAD_ADAPTER / TRAIN_SOCRATIC
+    std::string adapter_path;   // for LOAD_ADAPTER
+    json        train_params;   // for TRAIN_SOCRATIC
 
     server_task() = default;
 
@@ -338,6 +361,142 @@ struct completion_token_output {
 
 };
 
+// Socratic Tuner: per-layer KV cache statistics
+struct kv_layer_stat {
+    uint32_t layer_idx;
+    double   mean_abs_k;
+    double   mean_abs_v;
+    double   max_abs;
+    double   std_dev;
+    double   sparsity;
+};
+
+// Socratic Tuner: per-head attention activation
+struct kv_head_signal {
+    uint32_t layer_idx;
+    uint32_t head_idx;
+    double   mean_activation;
+    double   max_activation;
+};
+
+// Socratic Tuner: forward pass signal types
+struct fwd_residual_stat {
+    uint32_t layer_idx;
+    double   activation_norm;  // L2 norm of residual stream
+    double   cosine_sim;       // cosine similarity with previous layer
+};
+
+struct fwd_gate_stat {
+    uint32_t layer_idx;
+    double   sparsity;         // fraction of |x| < 0.01
+    double   mean_activation;  // mean |x|
+    double   gate_entropy;     // binned entropy of activation distribution
+};
+
+struct fwd_rmsnorm_stat {
+    uint32_t layer_idx;
+    double   rms_pre_attn;     // sqrt(mean(x^2)) of attn_norm output
+    double   rms_pre_ffn;      // sqrt(mean(x^2)) of ffn_norm output
+};
+
+struct fwd_q_proj_stat {
+    uint32_t layer_idx;
+    double   q_norm;           // mean L2 norm across query heads
+    double   q_k_cosine;       // mean cosine(Q, K) across KV heads
+};
+
+struct fwd_logit_lens_stat {
+    uint32_t layer_idx;
+    int32_t  top_token;        // argmax of softmax(RMSNorm(h) @ W_u)
+    double   top_confidence;   // max probability
+};
+
+struct fwd_entropy_lens_stat {
+    uint32_t layer_idx;
+    double   entropy;          // Shannon entropy of softmax(RMSNorm(h) @ W_u)
+    double   entropy_derivative; // H(l) - H(l-1), negative = narrowing
+};
+
+struct fwd_attn_stat {
+    uint32_t layer_idx;
+    double   mean_entropy;     // mean H(attn_weights) across heads
+    double   max_entropy;      // max H(attn_weights) across heads
+    double   recency_ratio;    // fraction of attention on recent positions
+};
+
+// Socratic Tuner: spectral analysis of hidden states
+struct fwd_spectral_stat {
+    uint32_t layer_idx;
+    double   centroid;    // spectral centroid (center of mass of frequency spectrum) [0,1]
+    double   bandwidth;   // spectral bandwidth (spread around centroid) [0,~0.5]
+    double   rolloff;     // frequency below which 85% of energy concentrated [0,1]
+};
+
+// Forward pass signal accumulator — passed as user_data to eval callback
+struct fwd_signal_accumulator {
+    bool active = false;
+
+    // Per-request flags
+    bool want_residual     = false;
+    bool want_gate         = false;
+    bool want_rmsnorm      = false;
+    bool want_q_proj       = false;
+    bool want_logit_lens   = false;
+    bool want_entropy_lens = false;
+    bool want_attention    = false;
+    bool want_spectral     = false;
+
+    int32_t layer_step     = 1;
+
+    // Accumulated results
+    std::vector<fwd_residual_stat>     residual_stats;
+    std::vector<fwd_gate_stat>         gate_stats;
+    std::vector<fwd_rmsnorm_stat>      rmsnorm_stats;
+    std::vector<fwd_q_proj_stat>       q_proj_stats;
+    std::vector<fwd_logit_lens_stat>   logit_lens_stats;
+    std::vector<fwd_entropy_lens_stat> entropy_lens_stats;
+    std::vector<fwd_attn_stat>         attn_stats;
+    std::vector<fwd_spectral_stat>     spectral_stats;
+
+    // Scratch storage for cross-layer computations
+    std::vector<float> prev_l_out;          // previous layer's l_out for cosine sim
+    std::vector<std::vector<float>> l_out_per_layer; // for logit lens post-processing
+    std::vector<uint32_t> l_out_layer_indices;       // which layers were stored
+
+    // Per-layer RMS norm tracking (attn_norm comes before ffn_norm in same layer)
+    std::unordered_map<uint32_t, double> rms_pre_attn_map;
+
+    // Previous entropy for derivative computation
+    double prev_entropy_lens = -1.0;
+
+    // Q vector storage for Q-K cosine computation (paired with Kcur handler)
+    std::vector<float> prev_q_data;
+    int32_t prev_q_n_heads = 0;
+    int32_t prev_q_head_dim = 0;
+    int32_t prev_q_layer = -1;
+
+    void clear() {
+        active = false;
+        residual_stats.clear();
+        gate_stats.clear();
+        rmsnorm_stats.clear();
+        q_proj_stats.clear();
+        logit_lens_stats.clear();
+        entropy_lens_stats.clear();
+        attn_stats.clear();
+        spectral_stats.clear();
+        prev_l_out.clear();
+        l_out_per_layer.clear();
+        l_out_layer_indices.clear();
+        rms_pre_attn_map.clear();
+        prev_entropy_lens = -1.0;
+        prev_q_data.clear();
+        prev_q_n_heads = 0;
+        prev_q_head_dim = 0;
+        prev_q_layer = -1;
+    }
+};
+
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
@@ -361,6 +520,20 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
+
+    // Socratic Tuner: KV cache layer stats + head signals
+    std::vector<kv_layer_stat>  kv_stats;
+    std::vector<kv_head_signal> kv_head_signals;
+
+    // Socratic Tuner: forward pass signals
+    std::vector<fwd_residual_stat>     fwd_residual;
+    std::vector<fwd_gate_stat>         fwd_gate;
+    std::vector<fwd_rmsnorm_stat>      fwd_rmsnorm;
+    std::vector<fwd_q_proj_stat>       fwd_q_proj;
+    std::vector<fwd_logit_lens_stat>   fwd_logit_lens;
+    std::vector<fwd_entropy_lens_stat> fwd_entropy_lens;
+    std::vector<fwd_attn_stat>         fwd_attn;
+    std::vector<fwd_spectral_stat>     fwd_spectral;
 
     // response formatting
     bool               verbose  = false;
@@ -581,6 +754,42 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+// Socratic Tuner: adapter load result
+struct server_task_result_load_adapter : server_task_result {
+    std::string status;     // "loaded" or "error"
+    std::string path;
+    int32_t     n_tensors = 0;
+    json        metadata;   // adapter GGUF metadata
+
+    virtual json to_json() override;
+};
+
+// Socratic Tuner: adapter query result
+struct server_task_result_get_adapter : server_task_result {
+    struct adapter_info {
+        std::string path;
+        float       scale;
+        json        metadata;
+    };
+    std::vector<adapter_info> adapters;
+
+    virtual json to_json() override;
+};
+
+// Socratic Tuner: training result
+struct server_task_result_train : server_task_result {
+    bool        success = false;
+    std::string adapter_path;
+    double      before_perplexity  = 0.0;
+    double      after_perplexity   = 0.0;
+    double      improvement        = 0.0;
+    int         turns_used         = 0;
+    double      training_time_seconds = 0.0;
+    std::string error;
+
     virtual json to_json() override;
 };
 

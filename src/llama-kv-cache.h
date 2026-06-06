@@ -148,6 +148,36 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     //
+    // KV cache signal extraction (Socratic Tuner extension)
+    //
+
+    struct layer_stats {
+        uint32_t layer_idx;
+        double   mean_abs_k;
+        double   mean_abs_v;
+        double   max_abs;
+        double   std_dev;
+        double   sparsity;   // fraction of values < 1e-6
+    };
+
+    // Extract per-layer statistics from the KV cache.
+    // Reads raw tensor data from backends, dequantizes if needed.
+    // `sample_cap` limits floats dequantized per tensor (0 = default 524288).
+    std::vector<layer_stats> extract_layer_stats(size_t sample_cap = 0) const;
+
+    struct head_signal {
+        uint32_t layer_idx;
+        uint32_t head_idx;
+        double   mean_activation;  // mean absolute value across head dimension
+        double   max_activation;   // peak absolute value
+    };
+
+    // Extract per-head activation statistics from the K cache.
+    // Returns one entry per (layer, head) pair.
+    // `sample_cap` limits floats dequantized per tensor (0 = default 524288).
+    std::vector<head_signal> extract_head_signals(size_t sample_cap = 0) const;
+
+    //
     // llama_kv_cache specific API
     //
 

@@ -563,6 +563,10 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
+    // Socratic Tuner: access to output (unembedding) tensors for logit lens
+    LLAMA_API const struct ggml_tensor * llama_model_get_output_tensor(const struct llama_model * model);
+    LLAMA_API const struct ggml_tensor * llama_model_get_output_norm_tensor(const struct llama_model * model);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
@@ -768,6 +772,57 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    //
+    // KV cache signal extraction (Socratic Tuner extension)
+    //
+
+    struct llama_kv_cache_layer_stats {
+        uint32_t layer_idx;
+        double   mean_abs_k;  // mean absolute value of K cache
+        double   mean_abs_v;  // mean absolute value of V cache
+        double   max_abs;     // peak absolute value across K and V
+        double   std_dev;     // standard deviation of absolute K values
+        double   sparsity;    // fraction of values < 1e-6
+    };
+
+    // Extract per-layer statistics from the KV cache of a context.
+    // Returns the number of layers written to `out`. If `out` is NULL, returns the number of layers available.
+    // `out_size` is the maximum number of entries that can be written to `out`.
+    // `sample_cap` limits floats dequantized per tensor (0 = default 524288). Lower = faster but less precise.
+    LLAMA_API int32_t llama_kv_cache_extract_stats(
+            struct llama_context * ctx,
+            struct llama_kv_cache_layer_stats * out,
+            int32_t out_size,
+            int32_t sample_cap);
+
+    struct llama_kv_cache_head_signal {
+        uint32_t layer_idx;
+        uint32_t head_idx;
+        double   mean_activation;  // mean absolute value across head dimension
+        double   max_activation;   // peak absolute value
+    };
+
+    // Extract per-head activation statistics from the K cache.
+    // Returns the number of entries written to `out`. If `out` is NULL, returns the count available.
+    // `sample_cap` limits floats dequantized per tensor (0 = default 524288).
+    LLAMA_API int32_t llama_kv_cache_extract_head_signals(
+            struct llama_context * ctx,
+            struct llama_kv_cache_head_signal * out,
+            int32_t out_size,
+            int32_t sample_cap);
+
+    //
+    // Forward pass eval callback (Socratic Tuner extension)
+    //
+
+    // Set/swap the eval callback on a context. This allows per-request callback
+    // registration without recreating the context. The callback fires after each
+    // tensor is computed during llama_decode(). Set callback=NULL to clear.
+    LLAMA_API void llama_set_eval_callback(
+            struct llama_context * ctx,
+            ggml_backend_sched_eval_callback callback,
+            void * user_data);
 
     //
     // State / sessions

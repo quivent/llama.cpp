@@ -264,6 +264,18 @@ task_params server_task::params_from_json_cmpl(
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
     params.return_tokens    = json_value(data,       "return_tokens",      false);
     params.return_progress  = json_value(data,       "return_progress",    false);
+    params.return_kv_cache  = json_value(data,       "return_kv_cache",    false);
+    params.signal_level     = json_value(data,       "signal_level",       std::string("zones"));
+    params.kv_layer_step    = json_value(data,       "kv_layer_step",      (int32_t)1);
+    params.kv_sample_cap    = json_value(data,       "kv_sample_cap",      (int32_t)0);
+    params.return_residual  = json_value(data,       "return_residual",    false);
+    params.return_gate      = json_value(data,       "return_gate",        false);
+    params.return_rmsnorm   = json_value(data,       "return_rmsnorm",     false);
+    params.return_q_proj    = json_value(data,       "return_q_proj",      false);
+    params.return_logit_lens = json_value(data,      "return_logit_lens",  false);
+    params.return_entropy_lens = json_value(data,    "return_entropy_lens", false);
+    params.return_attention  = json_value(data,       "return_attention",   false);
+    params.return_spectral  = json_value(data,       "return_spectral",    false);
     auto max_tokens         = json_value(data,       "max_tokens",         defaults.n_predict);
     params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_completion_tokens", max_tokens));
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
@@ -771,6 +783,138 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+
+    // Socratic Tuner: include signal data if present
+    {
+        bool has_signals = !kv_stats.empty() || !fwd_residual.empty() || !fwd_gate.empty()
+            || !fwd_rmsnorm.empty() || !fwd_q_proj.empty() || !fwd_logit_lens.empty()
+            || !fwd_entropy_lens.empty() || !fwd_attn.empty() || !fwd_spectral.empty();
+        if (has_signals) {
+            json internals = json::object();
+
+            if (!kv_stats.empty()) {
+                json layer_stats_arr = json::array();
+                for (const auto & s : kv_stats) {
+                    layer_stats_arr.push_back({
+                        {"layer_idx",  s.layer_idx},
+                        {"mean_abs_k", s.mean_abs_k},
+                        {"mean_abs_v", s.mean_abs_v},
+                        {"max_abs",    s.max_abs},
+                        {"std_dev",    s.std_dev},
+                        {"sparsity",   s.sparsity},
+                    });
+                }
+                internals["layer_stats"] = layer_stats_arr;
+            }
+            if (!kv_head_signals.empty()) {
+                json head_signals_arr = json::array();
+                for (const auto & h : kv_head_signals) {
+                    head_signals_arr.push_back({
+                        {"layer_idx",       h.layer_idx},
+                        {"head_idx",        h.head_idx},
+                        {"mean_activation", h.mean_activation},
+                        {"max_activation",  h.max_activation},
+                    });
+                }
+                internals["head_signals"] = head_signals_arr;
+            }
+
+        // Socratic Tuner: forward pass signals
+        if (!fwd_residual.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_residual) {
+                arr.push_back({
+                    {"layer_idx",      s.layer_idx},
+                    {"activation_norm", s.activation_norm},
+                    {"cosine_sim",     s.cosine_sim},
+                });
+            }
+            internals["residual_stats"] = arr;
+        }
+        if (!fwd_gate.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_gate) {
+                arr.push_back({
+                    {"layer_idx",       s.layer_idx},
+                    {"sparsity",        s.sparsity},
+                    {"mean_activation", s.mean_activation},
+                    {"gate_entropy",    s.gate_entropy},
+                });
+            }
+            internals["gate_stats"] = arr;
+        }
+        if (!fwd_rmsnorm.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_rmsnorm) {
+                arr.push_back({
+                    {"layer_idx",    s.layer_idx},
+                    {"rms_pre_attn", s.rms_pre_attn},
+                    {"rms_pre_ffn",  s.rms_pre_ffn},
+                });
+            }
+            internals["rmsnorm_stats"] = arr;
+        }
+        if (!fwd_q_proj.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_q_proj) {
+                arr.push_back({
+                    {"layer_idx",  s.layer_idx},
+                    {"q_norm",     s.q_norm},
+                    {"q_k_cosine", s.q_k_cosine},
+                });
+            }
+            internals["q_proj_stats"] = arr;
+        }
+        if (!fwd_logit_lens.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_logit_lens) {
+                arr.push_back({
+                    {"layer_idx",      s.layer_idx},
+                    {"top_token",      s.top_token},
+                    {"top_confidence", s.top_confidence},
+                });
+            }
+            internals["logit_lens_stats"] = arr;
+        }
+        if (!fwd_entropy_lens.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_entropy_lens) {
+                arr.push_back({
+                    {"layer_idx",          s.layer_idx},
+                    {"entropy",            s.entropy},
+                    {"entropy_derivative", s.entropy_derivative},
+                });
+            }
+            internals["entropy_lens_stats"] = arr;
+        }
+        if (!fwd_attn.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_attn) {
+                arr.push_back({
+                    {"layer_idx",     s.layer_idx},
+                    {"mean_entropy",  s.mean_entropy},
+                    {"max_entropy",   s.max_entropy},
+                    {"recency_ratio", s.recency_ratio},
+                });
+            }
+            internals["attention_stats"] = arr;
+        }
+        if (!fwd_spectral.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_spectral) {
+                arr.push_back({
+                    {"layer_idx",  s.layer_idx},
+                    {"centroid",   s.centroid},
+                    {"bandwidth",  s.bandwidth},
+                    {"rolloff",    s.rolloff},
+                });
+            }
+            internals["spectral_stats"] = arr;
+        }
+            res["internals"] = internals;
+        }
+    }
+
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -859,6 +1003,137 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
     };
+
+    // Socratic Tuner: include signal data if present
+    {
+        bool has_signals = !kv_stats.empty() || !fwd_residual.empty() || !fwd_gate.empty()
+            || !fwd_rmsnorm.empty() || !fwd_q_proj.empty() || !fwd_logit_lens.empty()
+            || !fwd_entropy_lens.empty() || !fwd_attn.empty() || !fwd_spectral.empty();
+        if (has_signals) {
+            json internals = json::object();
+
+            if (!kv_stats.empty()) {
+                json layer_stats_arr = json::array();
+                for (const auto & s : kv_stats) {
+                    layer_stats_arr.push_back({
+                        {"layer_idx",  s.layer_idx},
+                        {"mean_abs_k", s.mean_abs_k},
+                        {"mean_abs_v", s.mean_abs_v},
+                        {"max_abs",    s.max_abs},
+                        {"std_dev",    s.std_dev},
+                        {"sparsity",   s.sparsity},
+                    });
+                }
+                internals["layer_stats"] = layer_stats_arr;
+            }
+            if (!kv_head_signals.empty()) {
+                json head_signals_arr = json::array();
+                for (const auto & h : kv_head_signals) {
+                    head_signals_arr.push_back({
+                        {"layer_idx",       h.layer_idx},
+                        {"head_idx",        h.head_idx},
+                        {"mean_activation", h.mean_activation},
+                        {"max_activation",  h.max_activation},
+                    });
+                }
+                internals["head_signals"] = head_signals_arr;
+            }
+
+        // Socratic Tuner: forward pass signals
+        if (!fwd_residual.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_residual) {
+                arr.push_back({
+                    {"layer_idx",      s.layer_idx},
+                    {"activation_norm", s.activation_norm},
+                    {"cosine_sim",     s.cosine_sim},
+                });
+            }
+            internals["residual_stats"] = arr;
+        }
+        if (!fwd_gate.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_gate) {
+                arr.push_back({
+                    {"layer_idx",       s.layer_idx},
+                    {"sparsity",        s.sparsity},
+                    {"mean_activation", s.mean_activation},
+                    {"gate_entropy",    s.gate_entropy},
+                });
+            }
+            internals["gate_stats"] = arr;
+        }
+        if (!fwd_rmsnorm.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_rmsnorm) {
+                arr.push_back({
+                    {"layer_idx",    s.layer_idx},
+                    {"rms_pre_attn", s.rms_pre_attn},
+                    {"rms_pre_ffn",  s.rms_pre_ffn},
+                });
+            }
+            internals["rmsnorm_stats"] = arr;
+        }
+        if (!fwd_q_proj.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_q_proj) {
+                arr.push_back({
+                    {"layer_idx",  s.layer_idx},
+                    {"q_norm",     s.q_norm},
+                    {"q_k_cosine", s.q_k_cosine},
+                });
+            }
+            internals["q_proj_stats"] = arr;
+        }
+        if (!fwd_logit_lens.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_logit_lens) {
+                arr.push_back({
+                    {"layer_idx",      s.layer_idx},
+                    {"top_token",      s.top_token},
+                    {"top_confidence", s.top_confidence},
+                });
+            }
+            internals["logit_lens_stats"] = arr;
+        }
+        if (!fwd_entropy_lens.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_entropy_lens) {
+                arr.push_back({
+                    {"layer_idx",          s.layer_idx},
+                    {"entropy",            s.entropy},
+                    {"entropy_derivative", s.entropy_derivative},
+                });
+            }
+            internals["entropy_lens_stats"] = arr;
+        }
+        if (!fwd_attn.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_attn) {
+                arr.push_back({
+                    {"layer_idx",     s.layer_idx},
+                    {"mean_entropy",  s.mean_entropy},
+                    {"max_entropy",   s.max_entropy},
+                    {"recency_ratio", s.recency_ratio},
+                });
+            }
+            internals["attention_stats"] = arr;
+        }
+        if (!fwd_spectral.empty()) {
+            json arr = json::array();
+            for (const auto & s : fwd_spectral) {
+                arr.push_back({
+                    {"layer_idx",  s.layer_idx},
+                    {"centroid",   s.centroid},
+                    {"bandwidth",  s.bandwidth},
+                    {"rolloff",    s.rolloff},
+                });
+            }
+            internals["spectral_stats"] = arr;
+        }
+            res["internals"] = internals;
+        }
+    }
 
     // extra fields for debugging purposes
     if (verbose) {
@@ -1977,6 +2252,61 @@ json server_task_result_get_lora::to_json() {
 
 json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
+}
+
+//
+// server_task_result_load_adapter (Socratic Tuner)
+//
+
+json server_task_result_load_adapter::to_json() {
+    json result = {
+        {"status",    status},
+        {"path",      path},
+        {"n_tensors", n_tensors},
+    };
+    if (!metadata.empty()) {
+        result["metadata"] = metadata;
+    }
+    return result;
+}
+
+//
+// server_task_result_get_adapter (Socratic Tuner)
+//
+
+json server_task_result_get_adapter::to_json() {
+    json arr = json::array();
+    for (auto & a : adapters) {
+        json entry = {
+            {"path",  a.path},
+            {"scale", a.scale},
+        };
+        if (!a.metadata.empty()) {
+            entry["metadata"] = a.metadata;
+        }
+        arr.push_back(std::move(entry));
+    }
+    return json {{ "adapters", arr }};
+}
+
+//
+// server_task_result_train (Socratic Tuner)
+//
+
+json server_task_result_train::to_json() {
+    json result = {
+        {"success",                success},
+        {"adapter_path",           adapter_path},
+        {"before_perplexity",      before_perplexity},
+        {"after_perplexity",       after_perplexity},
+        {"improvement",            improvement},
+        {"turns_used",             turns_used},
+        {"training_time_seconds",  training_time_seconds},
+    };
+    if (!error.empty()) {
+        result["error"] = error;
+    }
+    return result;
 }
 
 //
